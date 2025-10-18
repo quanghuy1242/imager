@@ -15,7 +15,6 @@ urlencoding = "2"
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "webp"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-lru = "0.12"
 sha2 = "0.10"
 
 [dev-dependencies]

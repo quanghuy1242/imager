@@ -31,19 +31,15 @@ cargo test
 1. **HTTP entrypoint** (`/process` in `src/main.rs`):
    - Parses query parameters (`url`, `ops`, `format`).
    - Validates the URL and the operations list.
-2. **Caching layer**:
-   - Computes a cache key from `(url, ops, format)`.
-   - Returns a cached response if the transformed image already exists.
-3. **Download**:
+2. **Download**:
    - Reuses a single `reqwest::Client` instance.
    - Streams the remote body with a strict 5 MiB limit; rejects larger responses up front.
-4. **Blocking work** (offloaded with `tokio::task::spawn_blocking`):
+3. **Blocking work** (offloaded with `tokio::task::spawn_blocking`):
    - Decodes the image with Photon-rs (rejecting files wider or taller than 4096 px).
    - Applies the parsed operations sequentially.
    - Re-encodes the result (`png`, `jpeg`, or `webp`).
    - Generates an ETag from the encoded bytes.
-5. **Response**:
-   - Stores the processed image in an LRU cache (in-memory).
+4. **Response**:
    - Returns the bytes with `Content-Type`, `ETag`, and `Cache-Control: public, max-age=300`.
 
 ## Adding a New Image Operation
@@ -97,14 +93,8 @@ curl "http://localhost:3000/process?url=https%3A%2F%2Fexample.com%2Fphoto.jpg&op
 - Unsupported formats return `400 Bad Request`.
 - Upstream failures surface as `502 Bad Gateway`.
 
-### Caching
-
-- Responses are cached in-memory (LRU of 128 entries).
-- Headers include `Cache-Control: public, max-age=300` and an `ETag` so downstream CDNs or browsers can reuse results.
-
 ### Development & Testing
 
 - Run locally: `cargo run`
 - Unit/integration tests: `cargo test`
-- Adjust `CACHE_MAX_AGE_SECONDS`, `CACHE_SIZE`, or size limits near the top of `src/main.rs` to match deployment requirements.
-
+- Adjust `CACHE_MAX_AGE_SECONDS` or size limits near the top of `src/main.rs` to match deployment requirements.

@@ -1,6 +1,6 @@
-use std::{
-    collections::HashMap, net::SocketAddr, num::NonZeroUsize, sync::LazyLock, time::Duration,
-};
+//! Axum-based HTTP service that performs on-the-fly image processing with cache-friendly responses.
+
+use std::{collections::HashMap, net::SocketAddr, sync::LazyLock, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -13,7 +13,6 @@ use axum::{
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use lru::LruCache;
 use photon_rs::{
     PhotonImage,
     conv::gaussian_blur,
@@ -24,14 +23,17 @@ use photon_rs::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::{net::TcpListener, signal, sync::Mutex, task};
+use tokio::{net::TcpListener, signal, task};
 use urlencoding::decode;
 
+/// Upper bound on bytes we are willing to download from an upstream source.
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024; // 5 MiB
+/// Guardrail for both input and output width/height (prevents oversized transforms).
 const MAX_DIMENSION: u32 = 4096;
-const CACHE_SIZE: usize = 128;
+/// How long downstream caches (browser/CDN) may reuse a processed image.
 const CACHE_MAX_AGE_SECONDS: u32 = 300;
 
+/// Single reqwest client reused across requests so connections are pooled.
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -40,19 +42,7 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build reqwest client")
 });
 
-#[derive(Clone)]
-struct CachedImage {
-    mime: String,
-    data: Bytes,
-    etag: String,
-}
-
-static IMAGE_CACHE: LazyLock<Mutex<LruCache<String, CachedImage>>> = LazyLock::new(|| {
-    Mutex::new(LruCache::new(
-        NonZeroUsize::new(CACHE_SIZE).expect("cache size must be non-zero"),
-    ))
-});
-
+/// Deserialized query string payload (e.g. `?url=...&ops=...`).
 #[derive(Debug, Deserialize, Clone)]
 struct ProcessQuery {
     url: String,
@@ -61,6 +51,7 @@ struct ProcessQuery {
     format: Option<String>,
 }
 
+/// Rich AST describing the image operations requested by the client.
 #[derive(Debug, Clone)]
 enum Operation {
     Resize { width: u32, height: u32 },
@@ -113,6 +104,7 @@ impl IntoResponse for AppError {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Router is intentionally minimal; additional routes can mount more services here.
     let app = Router::new().route("/process", get(process_image));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
@@ -130,6 +122,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Wait for either Ctrl+C or (on Unix) SIGTERM before shutting the server down.
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -153,6 +146,7 @@ async fn shutdown_signal() {
     ctrl_c.await;
 }
 
+/// Handle `/process` requests end-to-end, wiring together download, transformation, and response assembly.
 async fn process_image(Query(query): Query<ProcessQuery>) -> Result<Response, AppError> {
     let url_str = decode(&query.url)
         .map_err(|err| AppError::bad_request(format!("invalid URL encoding: {err}")))?
@@ -170,11 +164,6 @@ async fn process_image(Query(query): Query<ProcessQuery>) -> Result<Response, Ap
     } else {
         Vec::new()
     };
-
-    let cache_key = cache_key(&url_str, query.ops.as_deref(), query.format.as_deref());
-    if let Some(entry) = get_cached(&cache_key).await {
-        return build_response(entry);
-    }
 
     let response = HTTP_CLIENT
         .get(url)
@@ -205,7 +194,6 @@ async fn process_image(Query(query): Query<ProcessQuery>) -> Result<Response, Ap
         .await
         .map_err(|err| AppError::internal(format!("processing task failed: {err}")))??;
 
-    set_cache(&cache_key, processed.clone()).await;
     build_response(processed)
 }
 
@@ -277,6 +265,7 @@ fn parse_operation(segment: &str) -> Result<Operation> {
     }
 }
 
+/// Parse resize arguments in either `WxH` or `key=value` form.
 fn parse_resize(args: &str) -> Result<Operation> {
     if args.is_empty() {
         return Err(anyhow!(
@@ -307,6 +296,7 @@ fn parse_resize(args: &str) -> Result<Operation> {
     Ok(Operation::Resize { width, height })
 }
 
+/// Interpret compact `800x600` style values.
 fn parse_dimensions(value: &str) -> Option<(u32, u32)> {
     let (width_str, height_str) = value.split_once('x')?;
     let width = width_str.trim().parse().ok()?;
@@ -314,6 +304,7 @@ fn parse_dimensions(value: &str) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+/// Convert CSV-style `key=value` arguments into a lookup map.
 fn parse_key_value_args(args: &str) -> HashMap<String, String> {
     args.split(',')
         .filter_map(|pair| {
@@ -323,6 +314,7 @@ fn parse_key_value_args(args: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Confirm requested dimensions are non-zero and within `MAX_DIMENSION`.
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     if width == 0 || height == 0 {
         return Err(anyhow!("resize width and height must be greater than zero"));
@@ -335,6 +327,7 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+/// Execute the parsed operation sequence on the given image buffer.
 fn apply_operations(image: &mut PhotonImage, operations: &[Operation]) -> Result<()> {
     for operation in operations {
         match operation {
@@ -378,7 +371,8 @@ impl std::fmt::Display for EncodeImageError {
 
 impl std::error::Error for EncodeImageError {}
 
-fn encode_image(image: &PhotonImage, format: &str) -> Result<(String, Vec<u8>), EncodeImageError> {
+/// Re-encode the processed Photon image into the requested format.
+fn encode_image(image: &PhotonImage, format: &str) -> Result<(String, Bytes), EncodeImageError> {
     use image::ImageOutputFormat;
     use std::io::Cursor;
 
@@ -396,38 +390,19 @@ fn encode_image(image: &PhotonImage, format: &str) -> Result<(String, Vec<u8>), 
         .write_to(&mut cursor, image_format)
         .map_err(|err| EncodeImageError::EncodeFailed(err.to_string()))?;
 
-    Ok((mime.to_string(), cursor.into_inner()))
+    Ok((mime.to_string(), Bytes::from(cursor.into_inner())))
 }
 
-fn cache_key(url: &str, ops: Option<&str>, format: Option<&str>) -> String {
-    format!(
-        "{}|ops:{}|format:{}",
-        url,
-        ops.unwrap_or(""),
-        format.unwrap_or("png")
-    )
-}
-
-async fn get_cached(key: &str) -> Option<CachedImage> {
-    let mut guard = IMAGE_CACHE.lock().await;
-    guard.get(key).cloned()
-}
-
-async fn set_cache(key: &str, value: CachedImage) {
-    let mut guard = IMAGE_CACHE.lock().await;
-    guard.put(key.to_string(), value);
-}
-
-fn build_response(entry: CachedImage) -> Result<Response, AppError> {
+fn build_response((mime, data): (String, Bytes)) -> Result<Response, AppError> {
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from(entry.data.clone()))
+        .body(Body::from(data.clone()))
         .map_err(|err| AppError::internal(format!("failed to build response: {err}")))?;
 
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(&entry.mime)
+        HeaderValue::from_str(&mime)
             .map_err(|_| AppError::internal("failed to build content type header"))?,
     );
     headers.insert(
@@ -437,7 +412,7 @@ fn build_response(entry: CachedImage) -> Result<Response, AppError> {
     );
     headers.insert(
         header::ETAG,
-        HeaderValue::from_str(&entry.etag)
+        HeaderValue::from_str(&compute_etag(&data))
             .map_err(|_| AppError::internal("failed to build etag header"))?,
     );
     headers.insert(
@@ -475,7 +450,7 @@ fn process_image_bytes(
     bytes: Bytes,
     ops: Vec<Operation>,
     format: &str,
-) -> Result<CachedImage, AppError> {
+) -> Result<(String, Bytes), AppError> {
     let mut image = open_image_from_bytes(&bytes)
         .map_err(|err| AppError::bad_request(format!("failed to decode image: {err}")))?;
 
@@ -495,11 +470,8 @@ fn process_image_bytes(
     }
 
     match encode_image(&image, format) {
-        Ok((mime, data)) => {
-            let data = Bytes::from(data);
-            let etag = compute_etag(&data);
-            Ok(CachedImage { mime, data, etag })
-        }
+        // Map encoder outcomes into HTTP-friendly errors.
+        Ok((mime, data)) => Ok((mime, data)),
         Err(EncodeImageError::UnsupportedFormat(fmt)) => Err(AppError::bad_request(format!(
             "unsupported output format '{fmt}' (supported: png, jpeg, webp)"
         ))),
@@ -515,6 +487,7 @@ fn compute_etag(data: &[u8]) -> String {
 }
 
 #[cfg(test)]
+/// Regression tests covering parser edge cases, size limits, and happy paths.
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
@@ -549,11 +522,6 @@ mod tests {
             .write_to(&mut cursor, ImageOutputFormat::Png)
             .unwrap();
         cursor.into_inner()
-    }
-
-    async fn clear_cache() {
-        let mut cache = super::IMAGE_CACHE.lock().await;
-        cache.clear();
     }
 
     #[test]
@@ -654,7 +622,6 @@ mod tests {
 
     #[tokio::test]
     async fn process_image_success_pipeline() {
-        clear_cache().await;
         let server = MockServer::start();
         let image_bytes = sample_png_bytes();
 
@@ -799,7 +766,6 @@ mod tests {
 
     #[tokio::test]
     async fn process_image_rejects_large_payload() {
-        clear_cache().await;
         let server = MockServer::start();
         let oversized = vec![0u8; super::MAX_IMAGE_BYTES + 1];
 
@@ -825,7 +791,6 @@ mod tests {
 
     #[tokio::test]
     async fn process_image_rejects_excessive_dimensions() {
-        clear_cache().await;
         let wide_image: ImageBuffer<Rgba<u8>, Vec<u8>> =
             ImageBuffer::from_pixel(super::MAX_DIMENSION + 1, 10, Rgba([0, 0, 0, 255]));
         let mut cursor = Cursor::new(Vec::new());
@@ -852,54 +817,5 @@ mod tests {
             .await
             .expect_err("dimensions over limit should fail");
         assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    #[tokio::test]
-    async fn process_image_serves_from_cache() {
-        clear_cache().await;
-        let server = MockServer::start();
-        let image_bytes = sample_png_bytes();
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path("/cache");
-            then.status(200)
-                .header("content-type", "image/png")
-                .body(image_bytes.clone());
-        });
-
-        let query = ProcessQuery {
-            url: server.url("/cache"),
-            ops: Some("grayscale|rotate:90".to_string()),
-            format: Some("png".to_string()),
-        };
-
-        let first = process_image(Query(query.clone()))
-            .await
-            .expect("first processing should succeed");
-        // fully consume body
-        first
-            .into_body()
-            .collect()
-            .await
-            .expect("first body collection")
-            .to_bytes();
-
-        assert_eq!(mock.calls(), 1);
-
-        let second = process_image(Query(query))
-            .await
-            .expect("second processing should hit cache");
-        second
-            .into_body()
-            .collect()
-            .await
-            .expect("second body collection")
-            .to_bytes();
-
-        assert_eq!(
-            mock.calls(),
-            1,
-            "cached response should avoid new upstream calls"
-        );
     }
 }
