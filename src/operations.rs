@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use photon_rs::{
     PhotonImage,
     conv::gaussian_blur,
@@ -21,6 +21,8 @@ pub enum Operation {
     FlipHorizontal,
     FlipVertical,
     Rotate { degrees: f32 },
+    ResizeKeepAspectWidth { width: u32 },
+    ResizeKeepAspectHeight { height: u32 },
 }
 
 pub fn parse_operations(raw: &str) -> Result<Vec<Operation>> {
@@ -87,6 +89,7 @@ fn parse_operation(segment: &str) -> Result<Operation> {
             Ok(Operation::Rotate { degrees })
         }
         "resize" => parse_resize(args),
+        "ratio" => parse_ratio(args),
         other => Err(anyhow!("unsupported operation '{other}'")),
     }
 }
@@ -153,12 +156,110 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+fn parse_ratio(args: &str) -> Result<Operation> {
+    if args.is_empty() {
+        return Err(anyhow!(
+            "ratio expects one dimension (e.g. ratio:width=800,keep=true or ratio:h=600)"
+        ));
+    }
+
+    let params = parse_key_value_args(args);
+    let keep_flag = params
+        .get("keep")
+        .or_else(|| params.get("keep_ratio"))
+        .map(|value| value.to_lowercase());
+
+    if let Some(flag) = keep_flag {
+        match flag.as_str() {
+            "true" | "1" | "yes" => {}
+            "false" | "0" | "no" => {
+                return Err(anyhow!(
+                    "ratio operation requires keep flag to be true; omit the flag to assume true"
+                ));
+            }
+            other => {
+                return Err(anyhow!(
+                    "ratio keep flag must be a boolean value, got '{other}'"
+                ));
+            }
+        }
+    }
+
+    let width_param = params.get("width").or_else(|| params.get("w"));
+    let height_param = params.get("height").or_else(|| params.get("h"));
+
+    match (width_param, height_param) {
+        (Some(width_str), None) => {
+            let width = width_str
+                .parse::<u32>()
+                .context("ratio width must be positive integer")?;
+            if width == 0 {
+                return Err(anyhow!("ratio width must be greater than zero"));
+            }
+            if width > MAX_DIMENSION {
+                return Err(anyhow!(
+                    "ratio width exceeds limit of {MAX_DIMENSION} pixels"
+                ));
+            }
+            Ok(Operation::ResizeKeepAspectWidth { width })
+        }
+        (None, Some(height_str)) => {
+            let height = height_str
+                .parse::<u32>()
+                .context("ratio height must be positive integer")?;
+            if height == 0 {
+                return Err(anyhow!("ratio height must be greater than zero"));
+            }
+            if height > MAX_DIMENSION {
+                return Err(anyhow!(
+                    "ratio height exceeds limit of {MAX_DIMENSION} pixels"
+                ));
+            }
+            Ok(Operation::ResizeKeepAspectHeight { height })
+        }
+        (Some(_), Some(_)) => Err(anyhow!(
+            "ratio expects exactly one dimension (width or height), but both were provided"
+        )),
+        (None, None) => Err(anyhow!(
+            "ratio expects a width or height (e.g. ratio:width=800)"
+        )),
+    }
+}
+
 /// Execute the parsed operation sequence on the given image buffer.
 pub fn apply_operations(image: &mut PhotonImage, operations: &[Operation]) -> Result<()> {
     for operation in operations {
         match operation {
             Operation::Resize { width, height } => {
                 *image = resize(image, *width, *height, SamplingFilter::Lanczos3);
+            }
+            Operation::ResizeKeepAspectWidth { width } => {
+                ensure!(
+                    image.get_width() > 0,
+                    "cannot maintain aspect ratio on zero-width image"
+                );
+                let scale = *width as f32 / image.get_width() as f32;
+                let mut new_height = (image.get_height() as f32 * scale).round();
+                if new_height < 1.0 {
+                    new_height = 1.0;
+                }
+                let new_height_u32 = new_height as u32;
+                validate_dimensions(*width, new_height_u32)?;
+                *image = resize(image, *width, new_height_u32, SamplingFilter::Lanczos3);
+            }
+            Operation::ResizeKeepAspectHeight { height } => {
+                ensure!(
+                    image.get_height() > 0,
+                    "cannot maintain aspect ratio on zero-height image"
+                );
+                let scale = *height as f32 / image.get_height() as f32;
+                let mut new_width = (image.get_width() as f32 * scale).round();
+                if new_width < 1.0 {
+                    new_width = 1.0;
+                }
+                let new_width_u32 = new_width as u32;
+                validate_dimensions(new_width_u32, *height)?;
+                *image = resize(image, new_width_u32, *height, SamplingFilter::Lanczos3);
             }
             Operation::Blur { radius } => {
                 gaussian_blur(image, *radius);
@@ -194,6 +295,23 @@ mod tests {
                 255, 255, 0, 255,
             ],
             2,
+            2,
+        )
+    }
+
+    fn sample_rect_photon_image() -> PhotonImage {
+        PhotonImage::new(
+            vec![
+                255, 0, 0, 255, //
+                0, 255, 0, 255, //
+                0, 0, 255, 255, //
+                255, 255, 0, 255, //
+                255, 0, 255, 255, //
+                0, 255, 255, 255, //
+                128, 128, 128, 255, //
+                64, 64, 64, 255,
+            ],
+            4,
             2,
         )
     }
@@ -246,6 +364,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_ratio_accepts_width() {
+        let ops = parse_operations("ratio:width=10").expect("ratio width should parse");
+        assert!(matches!(
+            ops[0],
+            Operation::ResizeKeepAspectWidth { width } if width == 10
+        ));
+    }
+
+    #[test]
+    fn parse_ratio_accepts_height() {
+        let ops = parse_operations("ratio:h=12").expect("ratio height should parse");
+        assert!(matches!(
+            ops[0],
+            Operation::ResizeKeepAspectHeight { height } if height == 12
+        ));
+    }
+
+    #[test]
+    fn parse_ratio_rejects_both_dimensions() {
+        let err = parse_operations("ratio:width=10,height=20")
+            .expect_err("ratio with both width and height should fail");
+        assert!(
+            err.to_string()
+                .contains("ratio expects exactly one dimension")
+        );
+    }
+
+    #[test]
     fn apply_operations_executes_all_paths() {
         let mut image = sample_photon_image();
         let operations = vec![
@@ -264,5 +410,25 @@ mod tests {
         assert!(image.get_width() > 0);
         assert!(image.get_height() > 0);
         assert!(!image.get_raw_pixels().is_empty());
+    }
+
+    #[test]
+    fn apply_ratio_preserves_aspect_using_width() {
+        let mut image = sample_rect_photon_image();
+        let operations = vec![Operation::ResizeKeepAspectWidth { width: 8 }];
+
+        apply_operations(&mut image, &operations).expect("ratio resize should succeed");
+        assert_eq!(image.get_width(), 8);
+        assert_eq!(image.get_height(), 4);
+    }
+
+    #[test]
+    fn apply_ratio_preserves_aspect_using_height() {
+        let mut image = sample_rect_photon_image();
+        let operations = vec![Operation::ResizeKeepAspectHeight { height: 6 }];
+
+        apply_operations(&mut image, &operations).expect("ratio resize should succeed");
+        assert_eq!(image.get_height(), 6);
+        assert_eq!(image.get_width(), 12);
     }
 }

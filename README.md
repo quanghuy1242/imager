@@ -1,102 +1,140 @@
 # Imager
 
-`imager` is an HTTP microservice for on-demand image processing. It downloads an image from a user-supplied URL, runs a configurable pipeline of Photon-rs operations, and returns the transformed pixels with CDN-friendly cache headers. The service is designed for real-time scenarios where UIs need to render formatted media quickly and consistently.
+`imager` is an Axum-based HTTP microservice for on-demand image transformation.  
+Give it a public image URL and a pipeline of operations; it downloads the pixels, applies the requested mutations with Photon-rs, and streams the result back with cache-friendly headers that work well behind CDNs.
 
-## Installation
+---
 
-Prerequisites:
+## At a Glance
+
+| Feature | Details |
+|---------|---------|
+| **Language / Runtime** | Rust (Tokio async runtime) |
+| **Core Dependencies** | `axum`, `reqwest`, `photon-rs`, `image`, `tokio` |
+| **Default Port** | `0.0.0.0:3000` |
+| **Payload Limits** | 5 MiB download cap, 4096×4096 dimension guardrail |
+| **Output Formats** | `png`, `jpeg`, `webp` |
+| **Cache Headers** | `Cache-Control: public, max-age=300`, strong `ETag` |
+
+---
+
+## Getting Started
+
+### Prerequisites
+
 - Rust toolchain 1.70+ (tested with stable)
 - Cargo
 
-Clone the repository and build:
+### Build & Run
 
 ```bash
-cargo build
-```
-
-Run the service (listens on `0.0.0.0:3000` by default):
-
-```bash
+git clone <repo-url>
+cd imager
 cargo run
 ```
 
-Execute tests:
+The service listens on `0.0.0.0:3000`. Override this by wrapping `web::run_server` or running behind a reverse proxy (nginx, fly.io, etc.).
+
+### Tests & Tooling
 
 ```bash
-cargo test
+cargo fmt     # Format code
+cargo test    # Run unit + integration tests
+cargo clippy  # Optional linting
 ```
 
-## Code Logic Flow
+All operations, parsers, and HTTP integration paths have dedicated tests under `src/`.
 
-1. **HTTP entrypoint** (`/process` in `src/main.rs`):
-   - Parses query parameters (`url`, `ops`, `format`, `quality`).
-   - Validates the URL and the operations list.
-   - Rejects invalid quality values outside the 1–100 range.
-2. **Download**:
-   - Reuses a single `reqwest::Client` instance.
-   - Streams the remote body with a strict 5 MiB limit; rejects larger responses up front.
-3. **Blocking work** (offloaded with `tokio::task::spawn_blocking`):
-   - Decodes the image with Photon-rs (rejecting files wider or taller than 4096 px).
-   - Applies the parsed operations sequentially.
-   - Re-encodes the result (`png`, `jpeg`, or `webp`).
-   - Generates an ETag from the encoded bytes.
-4. **Response**:
-   - Returns the bytes with `Content-Type`, `ETag`, and `Cache-Control: public, max-age=300`.
+---
 
-## Adding a New Image Operation
+## Endpoint Summary
 
-1. **Extend the `Operation` enum** (`src/main.rs`).
-2. **Update the parser**:
-   - Modify `parse_operation` to recognize the new operation string and convert it into your enum variant.
-   - Validate arguments (e.g., numeric ranges) and return `AppError::bad_request` on invalid input.
-3. **Apply the effect**:
-   - Update the `apply_operations` match block to call the corresponding Photon-rs (or custom) routine.
-4. **Tests**:
-   - Add/adjust unit tests in `#[cfg(test)]` to cover parsing, execution, and error paths.
+`GET /process`
 
-## Usage
+| Query Param | Required | Description |
+|-------------|----------|-------------|
+| `url`       | Yes      | Absolute URL to the upstream image. Must be reachable by the service. |
+| `ops`       | No       | Pipe separated list of operations. See below for supported syntax. |
+| `format`    | No       | Output format: `png` (default), `jpeg`, or `webp`. |
+| `quality`   | No       | Integer 1–100. Applies to lossy encoders (`jpeg`, `webp`). `100` keeps max fidelity. |
 
-### Endpoint
-
-```
-GET /process
-```
-
-### Query Parameters
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `url`     | Yes      | URL of the source image. Must be accessible by the service. |
-| `ops`     | No       | Pipe-delimited operations. Example: `resize:800x600|blur:radius=2|grayscale`. |
-| `format`  | No       | Output format (`png`, `jpeg`, `webp`). Defaults to `png`. |
-| `quality` | No       | Compression quality (1–100). `100` retains maximum quality; lower values reduce fidelity/size. |
-
-### Supported Operations
-
-- `resize:<width>x<height>` or `resize:width=800,height=600` (limits: 1 ≤ dimension ≤ 4096)
-- `blur:<radius>` or `blur:radius=4` or `blur:sigma=4` (radius must be > 0)
-- `flip:h` / `flip:horizontal`
-- `flip:v` / `flip:vertical`
-- `rotate:<degrees>` (any angle, e.g., `rotate:90`, `rotate:deg=45`)
-- `grayscale`
-
-Multiple operations can be chained with `|` in the order they should be applied.
-
-### Example
+Example:
 
 ```bash
-curl "http://localhost:3000/process?url=https%3A%2F%2Fexample.com%2Fphoto.jpg&ops=resize:800x600|grayscale&format=webp&quality=80" \
-  --output photo.webp
+curl "http://localhost:3000/process?url=https%3A%2F%2Fexample.com%2Fphoto.jpg&ops=ratio:width=800|blur:radius=2|grayscale&format=webp&quality=80" \
+  --output processed.webp
 ```
 
-### Limits & Errors
+---
 
-- Payload size: requests fail with `413 Payload Too Large` if the remote body exceeds 5 MiB or the decoded image exceeds 4096×4096.
-- Unsupported formats return `400 Bad Request`.
-- Upstream failures surface as `502 Bad Gateway`.
+## Supported Operations
 
-### Development & Testing
+Operations run in the order supplied. Combine multiple instructions with `|`.
 
-- Run locally: `cargo run`
-- Unit/integration tests: `cargo test`
-- Adjust `CACHE_MAX_AGE_SECONDS` or size limits near the top of `src/main.rs` to match deployment requirements.
+| Operation | Syntax | Notes |
+|-----------|--------|-------|
+| Resize (fixed) | `resize:800x600` or `resize:width=800,height=600` | Both dimensions required. 1 ≤ width,height ≤ 4096. |
+| Resize (keep ratio) | `ratio:width=800` or `ratio:height=600` or shorthand `ratio:w=800` | Computes the missing dimension to preserve aspect ratio. The optional `keep=true` flag is assumed. |
+| Blur | `blur:4`, `blur:radius=4`, `blur:sigma=2.5` | Radius must be > 0. Value is rounded to an integer for Photon-rs. |
+| Flip | `flip:h` / `flip:horizontal`, `flip:v` / `flip:vertical` | Mirrors the image along the selected axis. |
+| Rotate | `rotate:90`, `rotate:deg=45` | Accepts any floating-point degree value. |
+| Grayscale | `grayscale` | Converts to monochrome. |
+
+Unknown or malformed operations result in `400 Bad Request` with a descriptive JSON error payload.
+
+---
+
+## Error Handling & Limits
+
+| Scenario | HTTP Status | Description |
+|----------|-------------|-------------|
+| Remote body > 5 MiB | `413 Payload Too Large` | Enforced before buffering to protect memory. |
+| Source / output dimensions exceed 4096 | `413 Payload Too Large` | Applies before and after transformations. |
+| Unsupported format | `400 Bad Request` | When encoder cannot satisfy `format`. |
+| Invalid ops / params | `400 Bad Request` | Parsing failures, out-of-range quality, etc. |
+| Download errors | `502 Bad Gateway` | Bubbles up upstream HTTP failures / timeouts. |
+| Internal issues | `500 Internal Server Error` | Reserved for unexpected conditions (spawn failures, encoder panic). |
+
+Responses include a JSON body: `{"error": "<message>"}`.
+
+---
+
+## Project Layout
+
+```
+src/
+├── main.rs        # Thin binary entrypoint; delegates to web::run_server()
+├── constants.rs   # Size limits, cache durations, and other tunables
+├── encoding.rs    # Output format encoding (PNG/JPEG/WebP) + tests
+├── error.rs       # Shared AppError type implementing IntoResponse
+├── operations.rs  # Parser + executor for resize/ratio/blur/... operations
+├── processing.rs  # Blocking pipeline (decode -> apply -> encode)
+└── web.rs         # Axum router, handler, request validation, integration tests
+```
+
+This modular layout makes it easy to extend one layer without disturbing others—for example, adding a new operation involves touching only `operations.rs` and optionally `processing.rs`.
+
+---
+
+## Extending the Service
+
+1. **Add Operation Variant**  
+   - Extend `Operation` in `src/operations.rs`.  
+   - Update `parse_operation` (and helpers) to handle the new syntax.  
+   - Implement the behavior inside `apply_operations`.
+2. **Guardrails & Limits**  
+   - Reference `src/constants.rs` for shared bounds.  
+   - Use `AppError::bad_request` / `payload_too_large` for user-facing validation messages.
+3. **Tests**  
+   - Unit tests in the same module (`#[cfg(test)]`).  
+   - Add an integration test in `src/web.rs` if the change affects the HTTP response.
+
+---
+
+## Deployment Notes
+
+- **Concurrency:** Heavy image work is offloaded to `tokio::task::spawn_blocking` to keep async executors responsive.
+- **Caching:** Responses include strong ETags; combine with `Cache-Control` for CDN re-use. Clients can revalidate with `If-None-Match`.
+- **Timeouts:** The shared `reqwest::Client` has a 10s request timeout and 5s connect timeout—tune in one place (`src/web.rs`).
+- **Observability:** Add tracing/middleware in `web::router()` if you need structured logs or metrics.
+- **Security:** Only fetch from trusted upstreams. In production, put the service behind network rules or validate hostnames to avoid SSRF.

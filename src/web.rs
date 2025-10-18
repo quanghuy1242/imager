@@ -238,6 +238,26 @@ mod tests {
         cursor.into_inner()
     }
 
+    fn sample_rect_png_bytes() -> Vec<u8> {
+        let image: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(4, 2, |x, y| match (x, y) {
+                (0, 0) => Rgba([255, 0, 0, 255]),
+                (1, 0) => Rgba([0, 255, 0, 255]),
+                (2, 0) => Rgba([0, 0, 255, 255]),
+                (3, 0) => Rgba([255, 255, 0, 255]),
+                (0, 1) => Rgba([255, 0, 255, 255]),
+                (1, 1) => Rgba([0, 255, 255, 255]),
+                (2, 1) => Rgba([128, 128, 128, 255]),
+                _ => Rgba([64, 64, 64, 255]),
+            });
+
+        let mut cursor = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image.clone())
+            .write_to(&mut cursor, ImageOutputFormat::Png)
+            .unwrap();
+        cursor.into_inner()
+    }
+
     #[tokio::test]
     async fn process_image_success_pipeline() {
         let server = MockServer::start();
@@ -284,6 +304,45 @@ mod tests {
             .expect("response body to collect")
             .to_bytes();
         assert!(!bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_image_applies_ratio_operation() {
+        let server = MockServer::start();
+        let image_bytes = sample_rect_png_bytes();
+
+        let _mock = server.mock(|when, then| {
+            when.method(GET).path("/rect.png");
+            then.status(200)
+                .header("content-type", "image/png")
+                .body(image_bytes.clone());
+        });
+
+        let query = ProcessQuery {
+            url: server.url("/rect.png"),
+            ops: Some("ratio:width=8".to_string()),
+            format: None,
+            quality: None,
+        };
+
+        let response = process_image(Query(query))
+            .await
+            .expect("ratio processing should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body to collect")
+            .to_bytes();
+
+        assert!(!bytes.is_empty());
+
+        let dyn_img = image::load_from_memory(&bytes).expect("image should decode");
+        assert_eq!(dyn_img.width(), 8);
+        assert_eq!(dyn_img.height(), 4);
     }
 
     #[tokio::test]
