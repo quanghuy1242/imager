@@ -184,12 +184,12 @@ async fn process_image(Query(query): Query<ProcessQuery>) -> Result<Response, Ap
         .error_for_status()
         .map_err(|err| AppError::upstream_error(format!("upstream error: {err}")))?;
 
-    if let Some(length) = response.content_length() {
-        if length as usize > MAX_IMAGE_BYTES {
-            return Err(AppError::payload_too_large(format!(
-                "image exceeds {MAX_IMAGE_BYTES} bytes limit"
-            )));
-        }
+    if let Some(length) = response.content_length()
+        && length as usize > MAX_IMAGE_BYTES
+    {
+        return Err(AppError::payload_too_large(format!(
+            "image exceeds {MAX_IMAGE_BYTES} bytes limit"
+        )));
     }
 
     let body = read_with_limit(response).await.map_err(|err| match err {
