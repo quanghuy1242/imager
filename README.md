@@ -29,8 +29,9 @@ cargo test
 ## Code Logic Flow
 
 1. **HTTP entrypoint** (`/process` in `src/main.rs`):
-   - Parses query parameters (`url`, `ops`, `format`).
+   - Parses query parameters (`url`, `ops`, `format`, `quality`).
    - Validates the URL and the operations list.
+   - Rejects invalid quality values outside the 1–100 range.
 2. **Download**:
    - Reuses a single `reqwest::Client` instance.
    - Streams the remote body with a strict 5 MiB limit; rejects larger responses up front.
@@ -68,6 +69,7 @@ GET /process
 | `url`     | Yes      | URL of the source image. Must be accessible by the service. |
 | `ops`     | No       | Pipe-delimited operations. Example: `resize:800x600|blur:radius=2|grayscale`. |
 | `format`  | No       | Output format (`png`, `jpeg`, `webp`). Defaults to `png`. |
+| `quality` | No       | Compression quality (1–100). `100` retains maximum quality; lower values reduce fidelity/size. |
 
 ### Supported Operations
 
@@ -83,7 +85,7 @@ Multiple operations can be chained with `|` in the order they should be applied.
 ### Example
 
 ```bash
-curl "http://localhost:3000/process?url=https%3A%2F%2Fexample.com%2Fphoto.jpg&ops=resize:800x600|grayscale&format=webp" \
+curl "http://localhost:3000/process?url=https%3A%2F%2Fexample.com%2Fphoto.jpg&ops=resize:800x600|grayscale&format=webp&quality=80" \
   --output photo.webp
 ```
 

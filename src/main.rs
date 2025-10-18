@@ -49,6 +49,9 @@ struct ProcessQuery {
     ops: Option<String>,
     #[serde(default)]
     format: Option<String>,
+    #[serde(default)]
+    /// Optional compression quality (1-100); defaults to 100 (best quality).
+    quality: Option<u8>,
 }
 
 /// Rich AST describing the image operations requested by the client.
@@ -165,6 +168,15 @@ async fn process_image(Query(query): Query<ProcessQuery>) -> Result<Response, Ap
         Vec::new()
     };
 
+    let format = query.format.as_deref().unwrap_or("png").to_string();
+    let quality = query.quality.unwrap_or(100);
+
+    if quality == 0 || quality > 100 {
+        return Err(AppError::bad_request(
+            "quality must be between 1 and 100 (100 retains original quality)",
+        ));
+    }
+
     let response = HTTP_CLIENT
         .get(url)
         .send()
@@ -188,11 +200,11 @@ async fn process_image(Query(query): Query<ProcessQuery>) -> Result<Response, Ap
         ReadError::Upstream(message) => AppError::upstream_error(message),
     })?;
 
-    let format = query.format.as_deref().unwrap_or("png").to_string();
     let operations = ops.clone();
-    let processed = task::spawn_blocking(move || process_image_bytes(body, operations, &format))
-        .await
-        .map_err(|err| AppError::internal(format!("processing task failed: {err}")))??;
+    let processed =
+        task::spawn_blocking(move || process_image_bytes(body, operations, &format, quality))
+            .await
+            .map_err(|err| AppError::internal(format!("processing task failed: {err}")))??;
 
     build_response(processed)
 }
@@ -372,25 +384,59 @@ impl std::fmt::Display for EncodeImageError {
 impl std::error::Error for EncodeImageError {}
 
 /// Re-encode the processed Photon image into the requested format.
-fn encode_image(image: &PhotonImage, format: &str) -> Result<(String, Bytes), EncodeImageError> {
-    use image::ImageOutputFormat;
+fn encode_image(
+    image: &PhotonImage,
+    format: &str,
+    quality: u8,
+) -> Result<(String, Bytes), EncodeImageError> {
+    use image::{
+        ColorType, ImageOutputFormat,
+        codecs::{
+            jpeg::JpegEncoder,
+            webp::{WebPEncoder, WebPQuality},
+        },
+    };
     use std::io::Cursor;
 
     let dyn_img = dyn_image_from_raw(image);
     let format_lc = format.to_lowercase();
-    let (mime, image_format) = match format_lc.as_str() {
-        "png" => ("image/png", ImageOutputFormat::Png),
-        "jpeg" | "jpg" => ("image/jpeg", ImageOutputFormat::Jpeg(85)),
-        "webp" => ("image/webp", ImageOutputFormat::WebP),
-        other => return Err(EncodeImageError::UnsupportedFormat(other.to_string())),
-    };
-
     let mut cursor = Cursor::new(Vec::new());
-    dyn_img
-        .write_to(&mut cursor, image_format)
-        .map_err(|err| EncodeImageError::EncodeFailed(err.to_string()))?;
 
-    Ok((mime.to_string(), Bytes::from(cursor.into_inner())))
+    match format_lc.as_str() {
+        "png" => {
+            dyn_img
+                .write_to(&mut cursor, ImageOutputFormat::Png)
+                .map_err(|err| EncodeImageError::EncodeFailed(err.to_string()))?;
+            Ok(("image/png".to_string(), Bytes::from(cursor.into_inner())))
+        }
+        "jpeg" | "jpg" => {
+            let rgba = dyn_img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            let data = rgba.into_raw();
+            let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
+            encoder
+                .encode(&data, width, height, ColorType::Rgba8)
+                .map_err(|err| EncodeImageError::EncodeFailed(err.to_string()))?;
+            Ok(("image/jpeg".to_string(), Bytes::from(cursor.into_inner())))
+        }
+        "webp" => {
+            let rgba = dyn_img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            let data = rgba.into_raw();
+            if quality == 100 {
+                WebPEncoder::new_lossless(&mut cursor)
+                    .encode(&data, width, height, ColorType::Rgba8)
+                    .map_err(|err| EncodeImageError::EncodeFailed(err.to_string()))?;
+            } else {
+                #[allow(deprecated)]
+                WebPEncoder::new_with_quality(&mut cursor, WebPQuality::lossy(quality))
+                    .encode(&data, width, height, ColorType::Rgba8)
+                    .map_err(|err| EncodeImageError::EncodeFailed(err.to_string()))?;
+            }
+            Ok(("image/webp".to_string(), Bytes::from(cursor.into_inner())))
+        }
+        other => Err(EncodeImageError::UnsupportedFormat(other.to_string())),
+    }
 }
 
 fn build_response((mime, data): (String, Bytes)) -> Result<Response, AppError> {
@@ -450,6 +496,7 @@ fn process_image_bytes(
     bytes: Bytes,
     ops: Vec<Operation>,
     format: &str,
+    quality: u8,
 ) -> Result<(String, Bytes), AppError> {
     let mut image = open_image_from_bytes(&bytes)
         .map_err(|err| AppError::bad_request(format!("failed to decode image: {err}")))?;
@@ -469,7 +516,7 @@ fn process_image_bytes(
         )));
     }
 
-    match encode_image(&image, format) {
+    match encode_image(&image, format, quality) {
         // Map encoder outcomes into HTTP-friendly errors.
         Ok((mime, data)) => Ok((mime, data)),
         Err(EncodeImageError::UnsupportedFormat(fmt)) => Err(AppError::bad_request(format!(
@@ -595,17 +642,18 @@ mod tests {
     #[test]
     fn encode_image_supports_formats() {
         let image = sample_photon_image();
-        let (mime_png, data_png) = encode_image(&image, "png").expect("png encoding should work");
+        let (mime_png, data_png) =
+            encode_image(&image, "png", 100).expect("png encoding should work");
         assert_eq!(mime_png, "image/png");
         assert!(!data_png.is_empty());
 
         let (mime_jpeg, data_jpeg) =
-            encode_image(&image, "jpeg").expect("jpeg encoding should work");
+            encode_image(&image, "jpeg", 90).expect("jpeg encoding should work");
         assert_eq!(mime_jpeg, "image/jpeg");
         assert!(!data_jpeg.is_empty());
 
         let (mime_webp, data_webp) =
-            encode_image(&image, "webp").expect("webp encoding should work");
+            encode_image(&image, "webp", 90).expect("webp encoding should work");
         assert_eq!(mime_webp, "image/webp");
         assert!(!data_webp.is_empty());
     }
@@ -613,11 +661,24 @@ mod tests {
     #[test]
     fn encode_image_rejects_unknown_format() {
         let image = sample_photon_image();
-        let err = encode_image(&image, "gif").expect_err("gif should not be supported");
+        let err = encode_image(&image, "gif", 100).expect_err("gif should not be supported");
         match err {
             EncodeImageError::UnsupportedFormat(fmt) => assert_eq!(fmt, "gif"),
             _ => panic!("expected unsupported format error"),
         }
+    }
+
+    #[test]
+    fn encode_image_respects_quality_levels() {
+        let image = sample_photon_image();
+        let (_, high_quality) =
+            encode_image(&image, "jpeg", 100).expect("high quality jpeg should encode");
+        let (_, low_quality) =
+            encode_image(&image, "jpeg", 30).expect("low quality jpeg should encode");
+        assert!(
+            low_quality.len() <= high_quality.len(),
+            "lower quality should not increase size"
+        );
     }
 
     #[tokio::test]
@@ -636,6 +697,7 @@ mod tests {
             url: server.url("/image.png"),
             ops: Some("resize:4x4|blur:radius=2|flip:h|rotate:90".to_string()),
             format: Some("jpeg".to_string()),
+            quality: Some(75),
         };
 
         let response = process_image(Query(query))
@@ -673,6 +735,7 @@ mod tests {
             url: "%ZZ".to_string(),
             ops: None,
             format: None,
+            quality: None,
         };
 
         let err = process_image(Query(query))
@@ -688,6 +751,7 @@ mod tests {
             url: "%25".to_string(),
             ops: None,
             format: None,
+            quality: None,
         };
 
         let err = process_image(Query(query))
@@ -709,6 +773,7 @@ mod tests {
             url: server.url("/oops"),
             ops: None,
             format: None,
+            quality: None,
         };
 
         let err = process_image(Query(query))
@@ -732,6 +797,7 @@ mod tests {
             url: server.url("/image"),
             ops: Some("unknown:foo=bar".to_string()),
             format: None,
+            quality: None,
         };
 
         let err = process_image(Query(query))
@@ -739,6 +805,22 @@ mod tests {
             .expect_err("unknown op should fail");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("unsupported operation"));
+    }
+
+    #[tokio::test]
+    async fn process_image_rejects_invalid_quality() {
+        let query = ProcessQuery {
+            url: "https://example.com/image.png".to_string(),
+            ops: None,
+            format: Some("jpeg".to_string()),
+            quality: Some(0),
+        };
+
+        let err = process_image(Query(query))
+            .await
+            .expect_err("quality below range should fail");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("quality must be between 1 and 100"));
     }
 
     #[tokio::test]
@@ -755,6 +837,7 @@ mod tests {
             url: server.url("/image"),
             ops: Some("grayscale".to_string()),
             format: Some("gif".to_string()),
+            quality: None,
         };
 
         let err = process_image(Query(query))
@@ -781,6 +864,7 @@ mod tests {
             url: server.url("/large"),
             ops: None,
             format: None,
+            quality: None,
         };
 
         let err = process_image(Query(query))
@@ -811,6 +895,7 @@ mod tests {
             url: server.url("/wide"),
             ops: None,
             format: None,
+            quality: None,
         };
 
         let err = process_image(Query(query))
